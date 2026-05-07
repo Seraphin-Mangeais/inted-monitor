@@ -98,3 +98,113 @@ def get_market_price(session, item):
         items = data.get("items", []) if data else []
 
         prices = [
+            float(i["price"])
+            for i in items
+            if str(i["id"]) != str(item["id"]) and float(i.get("price", 0)) > 0
+        ]
+
+        if len(prices) < MIN_SIMILAR_ITEMS:
+            return None, 0
+
+        prices.sort()
+        trim = max(1, len(prices) // 10)
+        trimmed = prices[trim : len(prices) - trim] if len(prices) > 2 * trim else prices
+        return sum(trimmed) / len(trimmed), len(prices)
+    except Exception as e:
+        print(f"Erreur market: {e}")
+        return None, 0
+
+
+def send_telegram(message):
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+                "disable_web_page_preview": False,
+            },
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"Erreur Telegram: {e}")
+
+
+def main():
+    print("🔍 Démarrage du moniteur Vinted...")
+    session = get_session()
+    counter = 0
+
+    send_telegram(
+        "✅ Moniteur Vinted démarré !\n"
+        "Surveillance en temps réel toutes les 30s\n"
+        "Critères : -45% ou plus · Bon état minimum 🔍"
+    )
+
+    while True:
+        try:
+            if counter % 100 == 0:
+                session = get_session()
+            counter += 1
+
+            items = fetch_new_listings(session)
+            ts = datetime.now().strftime("%H:%M:%S")
+            print(f"[{ts}] {len(items)} articles récupérés")
+
+            for item in items:
+                item_id = str(item.get("id", ""))
+                if not item_id or item_id in seen_set:
+                    continue
+
+                seen_ids.append(item_id)
+                seen_set.add(item_id)
+
+                condition = item.get("status_id") or item.get("item_condition_id")
+                if condition not in GOOD_CONDITIONS:
+                    continue
+
+                try:
+                    price = float(item.get("price", 0))
+                except Exception:
+                    continue
+
+                if price <= 0:
+                    continue
+
+                avg_price, count = get_market_price(session, item)
+                if not avg_price:
+                    continue
+
+                discount = (avg_price - price) / avg_price
+                if discount < DISCOUNT_THRESHOLD:
+                    continue
+
+                label = CONDITION_LABELS.get(condition, "Bon état")
+                url = f"https://www.vinted.fr/items/{item_id}"
+
+                msg = (
+                    f"🔥 BONNE AFFAIRE DÉTECTÉE !\n\n"
+                    f"📦 {item.get('title', 'Article')}\n"
+                    f"💰 Prix : {price:.0f}€\n"
+                    f"📊 Marché : ~{avg_price:.0f}€ ({count} articles)\n"
+                    f"📉 Réduction : -{discount * 100:.0f}%\n"
+                    f"✨ État : {label}\n"
+                    f"🔗 {url}"
+                )
+
+                print(f"✅ ALERTE: {item.get('title')} — {price:.0f}€ vs {avg_price:.0f}€ (-{discount*100:.0f}%)")
+                send_telegram(msg)
+                time.sleep(0.5)
+
+            time.sleep(POLL_INTERVAL)
+
+        except KeyboardInterrupt:
+            print("Arrêt.")
+            break
+        except Exception as e:
+            print(f"Erreur: {e}")
+            time.sleep(30)
+
+
+if __name__ == "__main__":
+    main()
