@@ -1,4 +1,4 @@
-import requests
+import cloudscraper
 import time
 from collections import deque
 from datetime import datetime
@@ -7,7 +7,7 @@ TELEGRAM_TOKEN = "8397071421:AAHg7_ioahTXX2_aCziaJERJtL4g5CSBqm0"
 TELEGRAM_CHAT_ID = "5306743874"
 DISCOUNT_THRESHOLD = 0.45
 MIN_SIMILAR_ITEMS = 5
-POLL_INTERVAL = 22  # secondes entre chaque scan
+POLL_INTERVAL = 22
 
 GOOD_CONDITIONS = {1, 2, 3, 6}
 CONDITION_LABELS = {
@@ -20,81 +20,64 @@ CONDITION_LABELS = {
 seen_ids = deque(maxlen=3000)
 seen_set = set()
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Referer": "https://www.vinted.fr/",
-    "Origin": "https://www.vinted.fr",
-    "DNT": "1",
-    "Connection": "keep-alive",
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-origin",
-}
 
-
-def get_session():
-    session = requests.Session()
-    session.headers.update(HEADERS)
+def make_scraper():
+    scraper = cloudscraper.create_scraper(
+        browser={"browser": "chrome", "platform": "windows", "mobile": False}
+    )
+    scraper.headers.update({
+        "Accept-Language": "fr-FR,fr;q=0.9",
+        "Referer": "https://www.vinted.fr/",
+    })
     try:
-        r = session.get("https://www.vinted.fr", timeout=15)
+        r = scraper.get("https://www.vinted.fr", timeout=20)
         print(f"Session init: {r.status_code}")
         time.sleep(2)
-        session.get("https://www.vinted.fr/catalog", timeout=15)
-        time.sleep(1)
     except Exception as e:
         print(f"Erreur session: {e}")
-    return session
+    return scraper
 
 
-def vinted_get(session, url, params):
-    resp = session.get(url, params=params, timeout=15)
+def vinted_get(scraper, url):
+    resp = scraper.get(url, timeout=20)
+    print(f"GET {resp.status_code} | {resp.headers.get('Content-Type','?')[:40]}")
     if resp.status_code != 200:
-        print(f"HTTP {resp.status_code} — {url}")
+        print(f"Body: {resp.text[:300]}")
         return None
-    ct = resp.headers.get("Content-Type", "")
-    if "json" not in ct:
-        print(f"Réponse non-JSON ({ct[:50]}), Vinted bloque probablement la requête")
-        return None
-    return resp.json()
-
-
-def fetch_new_listings(session):
     try:
-        data = vinted_get(
-            session,
-            "https://www.vinted.fr/api/v2/catalog/items",
-            {
-                "page": 1,
-                "per_page": 96,
-                "order": "newest_first",
-                "status_ids[]": [1, 2, 3, 6],
-            },
+        return resp.json()
+    except Exception as e:
+        print(f"JSON parse error: {e} | Body: {resp.text[:200]}")
+        return None
+
+
+def fetch_new_listings(scraper):
+    try:
+        url = (
+            "https://www.vinted.fr/api/v2/catalog/items"
+            "?page=1&per_page=96&order=newest_first"
+            "&status_ids[]=1&status_ids[]=2&status_ids[]=3&status_ids[]=6"
         )
-        return data.get("items", []) if data else []
+        data = vinted_get(scraper, url)
+        items = data.get("items", []) if data else []
+        print(f"Articles récupérés: {len(items)}")
+        return items
     except Exception as e:
         print(f"Erreur fetch: {e}")
         return []
 
 
-def get_market_price(session, item):
+def get_market_price(scraper, item):
     try:
         words = " ".join((item.get("title") or "").split()[:3])
         catalog_id = item.get("catalog_id", "")
-
-        data = vinted_get(
-            session,
-            "https://www.vinted.fr/api/v2/catalog/items",
-            {
-                "search_text": words,
-                "catalog_ids": catalog_id,
-                "per_page": 48,
-                "order": "relevance",
-                "status_ids[]": [1, 2, 3, 6],
-            },
+        url = (
+            f"https://www.vinted.fr/api/v2/catalog/items"
+            f"?search_text={requests_encode(words)}&catalog_ids={catalog_id}"
+            f"&per_page=48&order=relevance"
+            f"&status_ids[]=1&status_ids[]=2&status_ids[]=3&status_ids[]=6"
         )
+        data = vinted_get(scraper, url)
         items = data.get("items", []) if data else []
 
         prices = [
@@ -108,22 +91,24 @@ def get_market_price(session, item):
 
         prices.sort()
         trim = max(1, len(prices) // 10)
-        trimmed = prices[trim : len(prices) - trim] if len(prices) > 2 * trim else prices
+        trimmed = prices[trim: len(prices) - trim] if len(prices) > 2 * trim else prices
         return sum(trimmed) / len(trimmed), len(prices)
     except Exception as e:
         print(f"Erreur market: {e}")
         return None, 0
 
 
+def requests_encode(text):
+    from urllib.parse import quote
+    return quote(text)
+
+
 def send_telegram(message):
     try:
+        import requests
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message,
-                "disable_web_page_preview": False,
-            },
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "disable_web_page_preview": False},
             timeout=10,
         )
     except Exception as e:
@@ -132,24 +117,23 @@ def send_telegram(message):
 
 def main():
     print("🔍 Démarrage du moniteur Vinted...")
-    session = get_session()
+    scraper = make_scraper()
     counter = 0
 
     send_telegram(
         "✅ Moniteur Vinted démarré !\n"
-        "Surveillance en temps réel toutes les 30s\n"
+        "Surveillance toutes les 22s\n"
         "Critères : -45% ou plus · Bon état minimum 🔍"
     )
 
     while True:
         try:
-            if counter % 100 == 0:
-                session = get_session()
+            if counter > 0 and counter % 80 == 0:
+                scraper = make_scraper()
             counter += 1
 
-            items = fetch_new_listings(session)
+            items = fetch_new_listings(scraper)
             ts = datetime.now().strftime("%H:%M:%S")
-            print(f"[{ts}] {len(items)} articles récupérés")
 
             for item in items:
                 item_id = str(item.get("id", ""))
@@ -171,7 +155,7 @@ def main():
                 if price <= 0:
                     continue
 
-                avg_price, count = get_market_price(session, item)
+                avg_price, count = get_market_price(scraper, item)
                 if not avg_price:
                     continue
 
