@@ -1,10 +1,13 @@
-import cloudscraper
+import os
 import time
+import requests
 from collections import deque
 from datetime import datetime
 
 TELEGRAM_TOKEN = "8397071421:AAHg7_ioahTXX2_aCziaJERJtL4g5CSBqm0"
 TELEGRAM_CHAT_ID = "5306743874"
+VINTED_EMAIL = os.environ.get("VINTED_EMAIL", "")
+VINTED_PASSWORD = os.environ.get("VINTED_PASSWORD", "")
 DISCOUNT_THRESHOLD = 0.45
 MIN_SIMILAR_ITEMS = 5
 POLL_INTERVAL = 22
@@ -20,64 +23,121 @@ CONDITION_LABELS = {
 seen_ids = deque(maxlen=3000)
 seen_set = set()
 
+BASE = "https://www.vinted.fr"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "fr-FR,fr;q=0.9",
+    "Referer": "https://www.vinted.fr/",
+    "Origin": "https://www.vinted.fr",
+}
 
-def make_scraper():
-    scraper = cloudscraper.create_scraper(
-        browser={"browser": "chrome", "platform": "windows", "mobile": False}
-    )
-    scraper.headers.update({
-        "Accept-Language": "fr-FR,fr;q=0.9",
-        "Referer": "https://www.vinted.fr/",
-    })
+
+def make_session():
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    return session
+
+
+def get_csrf_token(session):
+    r = session.post(f"{BASE}/oauth/token", timeout=15)
     try:
-        r = scraper.get("https://www.vinted.fr", timeout=20)
-        print(f"Session init: {r.status_code}")
-        time.sleep(2)
-    except Exception as e:
-        print(f"Erreur session: {e}")
-    return scraper
+        return r.json().get("csrf_token", "")
+    except Exception:
+        return ""
 
 
-def vinted_get(scraper, url):
-    resp = scraper.get(url, timeout=20)
-    print(f"GET {resp.status_code} | {resp.headers.get('Content-Type','?')[:40]}")
+def login(session):
+    print("Connexion à Vinted...")
+    # Visite initiale pour obtenir les cookies
+    session.get(BASE, timeout=15)
+    time.sleep(1)
+
+    # Récupère le CSRF token
+    r = session.get(f"{BASE}/api/v2/oauth/token_refresh", timeout=15)
+    csrf = ""
+    try:
+        csrf = r.json().get("csrf_token", "")
+    except Exception:
+        pass
+
+    if not csrf:
+        # Essai alternatif
+        r2 = session.get(f"{BASE}/web/users/sign_in", timeout=15)
+        for cookie in session.cookies:
+            if "csrf" in cookie.name.lower():
+                csrf = cookie.value
+                break
+
+    session.headers.update({"X-Csrf-Token": csrf})
+
+    # Login
+    r = session.post(
+        f"{BASE}/api/v2/users/login",
+        json={
+            "user": {
+                "login": VINTED_EMAIL,
+                "password": VINTED_PASSWORD,
+                "remember_me": True,
+            }
+        },
+        timeout=15,
+    )
+    print(f"Login: {r.status_code}")
+    if r.status_code == 200:
+        data = r.json()
+        user = data.get("user", {})
+        print(f"Connecté en tant que : {user.get('login', '?')}")
+        return True
+    else:
+        print(f"Échec login: {r.text[:200]}")
+        return False
+
+
+def vinted_get(session, url):
+    resp = session.get(url, timeout=20)
+    if resp.status_code == 401 or resp.status_code == 403:
+        print(f"Token expiré ({resp.status_code}), reconnexion...")
+        login(session)
+        resp = session.get(url, timeout=20)
     if resp.status_code != 200:
-        print(f"Body: {resp.text[:300]}")
+        print(f"HTTP {resp.status_code} | {resp.text[:150]}")
         return None
     try:
         return resp.json()
     except Exception as e:
-        print(f"JSON parse error: {e} | Body: {resp.text[:200]}")
+        print(f"JSON error: {e} | {resp.text[:100]}")
         return None
 
 
-def fetch_new_listings(scraper):
+def fetch_new_listings(session):
     try:
         url = (
-            "https://www.vinted.fr/api/v2/catalog/items"
+            f"{BASE}/api/v2/catalog/items"
             "?page=1&per_page=96&order=newest_first"
             "&status_ids[]=1&status_ids[]=2&status_ids[]=3&status_ids[]=6"
         )
-        data = vinted_get(scraper, url)
+        data = vinted_get(session, url)
         items = data.get("items", []) if data else []
-        print(f"Articles récupérés: {len(items)}")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {len(items)} articles récupérés")
         return items
     except Exception as e:
         print(f"Erreur fetch: {e}")
         return []
 
 
-def get_market_price(scraper, item):
+def get_market_price(session, item):
     try:
+        from urllib.parse import quote
         words = " ".join((item.get("title") or "").split()[:3])
         catalog_id = item.get("catalog_id", "")
         url = (
-            f"https://www.vinted.fr/api/v2/catalog/items"
-            f"?search_text={requests_encode(words)}&catalog_ids={catalog_id}"
+            f"{BASE}/api/v2/catalog/items"
+            f"?search_text={quote(words)}&catalog_ids={catalog_id}"
             f"&per_page=48&order=relevance"
             f"&status_ids[]=1&status_ids[]=2&status_ids[]=3&status_ids[]=6"
         )
-        data = vinted_get(scraper, url)
+        data = vinted_get(session, url)
         items = data.get("items", []) if data else []
 
         prices = [
@@ -98,14 +158,8 @@ def get_market_price(scraper, item):
         return None, 0
 
 
-def requests_encode(text):
-    from urllib.parse import quote
-    return quote(text)
-
-
 def send_telegram(message):
     try:
-        import requests
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "disable_web_page_preview": False},
@@ -116,9 +170,16 @@ def send_telegram(message):
 
 
 def main():
+    if not VINTED_EMAIL or not VINTED_PASSWORD:
+        print("❌ VINTED_EMAIL et VINTED_PASSWORD manquants dans les variables d'environnement")
+        return
+
     print("🔍 Démarrage du moniteur Vinted...")
-    scraper = make_scraper()
-    counter = 0
+    session = make_session()
+
+    if not login(session):
+        print("❌ Connexion impossible, arrêt.")
+        return
 
     send_telegram(
         "✅ Moniteur Vinted démarré !\n"
@@ -126,14 +187,14 @@ def main():
         "Critères : -45% ou plus · Bon état minimum 🔍"
     )
 
+    counter = 0
     while True:
         try:
-            if counter > 0 and counter % 80 == 0:
-                scraper = make_scraper()
+            if counter > 0 and counter % 100 == 0:
+                login(session)
             counter += 1
 
-            items = fetch_new_listings(scraper)
-            ts = datetime.now().strftime("%H:%M:%S")
+            items = fetch_new_listings(session)
 
             for item in items:
                 item_id = str(item.get("id", ""))
@@ -155,7 +216,7 @@ def main():
                 if price <= 0:
                     continue
 
-                avg_price, count = get_market_price(scraper, item)
+                avg_price, count = get_market_price(session, item)
                 if not avg_price:
                     continue
 
@@ -164,7 +225,7 @@ def main():
                     continue
 
                 label = CONDITION_LABELS.get(condition, "Bon état")
-                url = f"https://www.vinted.fr/items/{item_id}"
+                url = f"{BASE}/items/{item_id}"
 
                 msg = (
                     f"🔥 BONNE AFFAIRE DÉTECTÉE !\n\n"
